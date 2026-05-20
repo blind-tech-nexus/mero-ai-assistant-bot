@@ -9,7 +9,7 @@ async def transcribe_audio_bytes(audio_bytes: bytes, mime_type: str, display_nam
     if not file_uri:
         return None, key or "Failed to upload file"
 
-    model = "gemini-2.5-flash"
+    model = "gemini-2.0-flash-exp"
     return await transcribe_uploaded_file(file_uri, used_mime or mime_type, key, model=model)
 
 

@@ -66,7 +66,7 @@ async def upload_inline_file(audio_bytes: bytes, mime_type: str, display_name: s
     return None, None, "Failed to upload audio with available API keys"
 
 
-async def transcribe_uploaded_file(file_uri: str, mime_type: str, api_key: str, model: str = "gemini-2.5-flash") -> tuple[Optional[str], Optional[str]]:
+async def transcribe_uploaded_file(file_uri: str, mime_type: str, api_key: str, model: str = "gemini-2.0-flash-exp") -> tuple[Optional[str], Optional[str]]:
     body = {
         "contents": [{"role": "user", "parts": [{"file_data": {"mime_type": mime_type, "file_uri": file_uri}}, {"text": TRANSCRIBE_PROMPT}]}],
         "generationConfig": {"maxOutputTokens": 65536, "temperature": 0.0},
