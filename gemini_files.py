@@ -3,7 +3,7 @@ from typing import Optional
 
 import httpx
 
-from api import extract_ai_text
+from api import extract_ai_text, _is_retryable_status
 from api_keys import fetch_api_keys, get_keys
 
 TRANSCRIBE_PROMPT = (
@@ -25,7 +25,7 @@ async def upload_inline_file(audio_bytes: bytes, mime_type: str, display_name: s
         return None, None, "No API keys available"
 
     async with httpx.AsyncClient(timeout=180.0) as client:
-        for key in keys:
+        for idx, key in enumerate(keys, start=1):
             try:
                 start_resp = await client.post(
                     "https://generativelanguage.googleapis.com/upload/v1beta/files",
@@ -39,7 +39,11 @@ async def upload_inline_file(audio_bytes: bytes, mime_type: str, display_name: s
                     },
                     json={"file": {"display_name": display_name[:80] or "audio_upload"}},
                 )
+                # Only continue to next key if this one failed with retryable error
                 if start_resp.status_code >= 400:
+                    if not _is_retryable_status(start_resp.status_code):
+                        # Non-retryable error, but still try other keys in case this key is invalid
+                        pass
                     continue
                 upload_url = start_resp.headers.get("x-goog-upload-url")
                 if not upload_url:
@@ -54,6 +58,8 @@ async def upload_inline_file(audio_bytes: bytes, mime_type: str, display_name: s
                     content=audio_bytes,
                 )
                 if upload_resp.status_code >= 400:
+                    if not _is_retryable_status(upload_resp.status_code):
+                        pass
                     continue
                 data = upload_resp.json()
                 file_obj = data.get("file", {})
@@ -62,6 +68,7 @@ async def upload_inline_file(audio_bytes: bytes, mime_type: str, display_name: s
                 if file_uri:
                     return file_uri, used_mime, key
             except Exception:
+                # Network error - try next key
                 continue
     return None, None, "Failed to upload audio with available API keys"
 

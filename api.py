@@ -18,6 +18,11 @@ def get_model_for_user(chat_id: int) -> str:
     return USER_MODEL
 
 
+def _is_retryable_status(status_code: int) -> bool:
+    """Check if the HTTP status code indicates a retryable error (rate limit, quota, server error)."""
+    return status_code in (429, 403, 500, 502, 503, 504)
+
+
 def _ordered_keys(preferred_key: Optional[str] = None) -> list[str]:
     keys = [key for key in get_keys() if key]
     if preferred_key and preferred_key in keys:
@@ -79,19 +84,36 @@ async def try_api_call(body_json: str, model: str, preferred_key: Optional[str] 
     if not keys:
         return None, "No API keys available"
     failures: list[str] = []
+    last_non_retryable_error: Optional[str] = None
+    
     async with httpx.AsyncClient(timeout=120.0) as client:
         for idx, key in enumerate(keys, start=1):
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
             try:
                 resp = await client.post(url, content=body_json, headers={"Content-Type": "application/json"})
             except Exception as exc:
+                # Network error - try next key
                 failures.append(f"key#{idx}: request_error:{exc.__class__.__name__}")
                 continue
+            
             if resp.status_code == 200:
                 return resp.text, None
-            # Only continue to next key if this one failed
-            failures.append(f"key#{idx}: status_{resp.status_code}")
-            # Continue iterating through all keys until one succeeds
+            
+            # Check if this is a retryable error (rate limit, quota, server error)
+            if _is_retryable_status(resp.status_code):
+                # This key might work later, but try next key for now
+                failures.append(f"key#{idx}: status_{resp.status_code} (retryable)")
+                continue
+            
+            # Non-retryable error (e.g., 400 bad request, 401 invalid key)
+            # Don't try other keys if the error is not about rate limiting/quota
+            last_non_retryable_error = f"key#{idx}: status_{resp.status_code}"
+            # Still continue to try other keys in case this key is specifically invalid
+            failures.append(last_non_retryable_error)
+    
+    # All keys exhausted
+    if last_non_retryable_error and not any("(retryable)" in f for f in failures):
+        return None, last_non_retryable_error
     return None, "; ".join(failures) if failures else "All API keys exhausted"
 
 
