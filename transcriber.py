@@ -1,16 +1,24 @@
 from typing import Optional
 
-from gemini_files import upload_inline_file, transcribe_uploaded_file
+from gemini_files import transcribe_audio_inline
 from message import download_telegram_file, send_document_bytes, send_message
+from config import USER_MODEL
 
-MAX_AUDIO_BYTES = 50 * 1024 * 1024
-async def transcribe_audio_bytes(audio_bytes: bytes, mime_type: str, display_name: str = "audio", chat_id: Optional[int] = None) -> tuple[Optional[str], Optional[str]]:
-    file_uri, used_mime, key = await upload_inline_file(audio_bytes, mime_type, display_name)
-    if not file_uri:
-        return None, key or "Failed to upload file"
+MAX_AUDIO_BYTES = 20 * 1024 * 1024  # 20MB limit for inline data
 
-    model = "gemini-2.0-flash-exp"
-    return await transcribe_uploaded_file(file_uri, used_mime or mime_type, key, model=model)
+
+async def transcribe_audio_bytes(
+    audio_bytes: bytes,
+    mime_type: str,
+    display_name: str = "audio",
+    chat_id: Optional[int] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Transcribe audio bytes using Gemini inline_data approach."""
+    return await transcribe_audio_inline(
+        audio_bytes,
+        mime_type,
+        model=USER_MODEL,
+    )
 
 
 async def transcribe_from_telegram_message(cid: int, message: dict) -> bool:
@@ -38,7 +46,7 @@ async def transcribe_from_telegram_message(cid: int, message: dict) -> bool:
         return False
 
     if file_size > MAX_AUDIO_BYTES:
-        await send_message(cid, "⚠️ Audio must be under 50 MB.")
+        await send_message(cid, "⚠️ Audio must be under 20 MB for inline transcription.")
         return False
 
     await send_message(cid, "🎙️ Transcribing your audio...")
@@ -47,7 +55,9 @@ async def transcribe_from_telegram_message(cid: int, message: dict) -> bool:
         await send_message(cid, "❌ Failed to download your audio.")
         return False
 
-    transcription, error = await transcribe_audio_bytes(audio_bytes, mime_type, display_name, chat_id=cid)
+    transcription, error = await transcribe_audio_bytes(
+        audio_bytes, mime_type, display_name, chat_id=cid
+    )
     if error or not transcription:
         await send_message(cid, f"❌ Transcription failed. {error or ''}".strip())
         return False

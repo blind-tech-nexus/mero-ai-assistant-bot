@@ -10,12 +10,22 @@ def is_group_chat(message: dict) -> bool:
 
 
 def extract_group_prompt(message: dict) -> Optional[str]:
-    """Return cleaned prompt only when the bot is explicitly mentioned in a group message."""
+    """Return cleaned prompt only when the bot is explicitly mentioned in a group message.
+
+    Supports:
+      - @botusername message
+      - @ai message
+      - Any custom aliases from BOT_MENTION_ALIASES
+    """
     text = (message.get("text") or "").strip()
     if not text:
         return None
 
-    aliases = {a.lower().lstrip("@") for a in BOT_MENTION_ALIASES if a}
+    # Build alias set: always include "ai" plus configured aliases
+    aliases = {"ai"}
+    for a in BOT_MENTION_ALIASES:
+        if a:
+            aliases.add(a.lower().lstrip("@"))
     if BOT_USERNAME:
         aliases.add(BOT_USERNAME.lower().lstrip("@"))
 

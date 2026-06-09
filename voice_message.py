@@ -1,7 +1,8 @@
-from database import save_message, get_all_history, get_user_voice
+from database import save_message, get_all_history, get_user_voice, get_file_data
 from message import send_message, download_telegram_file, send_chat_action, send_voice_bytes
 from transcriber import transcribe_audio_bytes
-from agent import agent_route
+from api import handle_gemini
+from system import get_system_text
 from tts import generate_tts
 
 
@@ -32,7 +33,23 @@ async def handle_voice(cid: int, voice: dict, name: str) -> None:
         return
     save_message(cid, "user", f"[Voice] {transcription_text}")
     await send_message(cid, f"📝 Transcribed: {transcription_text}")
-    await agent_route(cid, transcription_text, name)
+
+    # Send transcribed text directly to Gemini (with function calling support)
+    current_parts: list = [{"text": transcription_text}]
+    file_data = get_file_data(cid)
+    has_file = False
+    if file_data and file_data.get("base64"):
+        current_parts.append({"inlineData": {"mimeType": file_data["mime_type"], "data": file_data["base64"]}})
+        has_file = True
+    await handle_gemini(
+        cid,
+        current_parts,
+        get_system_text(name, cid),
+        use_tools=not has_file,
+        user_name=name,
+    )
+
+    # Generate voice response for the AI reply
     history = get_all_history(cid)
     if not history:
         return

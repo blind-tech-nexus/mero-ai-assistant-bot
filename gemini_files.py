@@ -1,10 +1,15 @@
 import json
+import base64
+import logging
 from typing import Optional
 
 import httpx
 
 from api import extract_ai_text, _is_retryable_status
-from api_keys import fetch_api_keys, get_keys
+from api_keys import fetch_api_keys, KeyRotator
+from config import USER_MODEL
+
+logger = logging.getLogger("mero.gemini_files")
 
 TRANSCRIBE_PROMPT = (
     "Transcribe the uploaded audio exactly in its original language. "
@@ -12,79 +17,86 @@ TRANSCRIBE_PROMPT = (
 )
 
 
-async def ordered_keys() -> list[str]:
-    ok = await fetch_api_keys()
-    if not ok:
-        return []
-    return [k for k in get_keys() if k]
+async def transcribe_audio_inline(
+    audio_bytes: bytes,
+    mime_type: str,
+    model: str = USER_MODEL,
+    preferred_key: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Transcribe audio using inline base64 data directly in generateContent.
 
+    This avoids the file upload API entirely — just base64-encode the audio
+    and send it as inline_data in the request body. Works for files up to 20MB.
+    Uses KeyRotator for proper sequential key iteration.
+    """
+    if not await fetch_api_keys():
+        return None, "No API keys available"
 
-async def upload_inline_file(audio_bytes: bytes, mime_type: str, display_name: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
-    keys = await ordered_keys()
-    if not keys:
-        return None, None, "No API keys available"
+    # Base64-encode the audio bytes
+    encoded_audio = base64.b64encode(audio_bytes).decode("utf-8")
 
-    async with httpx.AsyncClient(timeout=180.0) as client:
-        for idx, key in enumerate(keys, start=1):
-            try:
-                start_resp = await client.post(
-                    "https://generativelanguage.googleapis.com/upload/v1beta/files",
-                    headers={
-                        "x-goog-api-key": key,
-                        "X-Goog-Upload-Protocol": "resumable",
-                        "X-Goog-Upload-Command": "start",
-                        "X-Goog-Upload-Header-Content-Length": str(len(audio_bytes)),
-                        "X-Goog-Upload-Header-Content-Type": mime_type,
-                        "Content-Type": "application/json",
-                    },
-                    json={"file": {"display_name": display_name[:80] or "audio_upload"}},
-                )
-                # Only continue to next key if this one failed with retryable error
-                if start_resp.status_code >= 400:
-                    if not _is_retryable_status(start_resp.status_code):
-                        # Non-retryable error, but still try other keys in case this key is invalid
-                        pass
-                    continue
-                upload_url = start_resp.headers.get("x-goog-upload-url")
-                if not upload_url:
-                    continue
-                upload_resp = await client.post(
-                    upload_url,
-                    headers={
-                        "Content-Length": str(len(audio_bytes)),
-                        "X-Goog-Upload-Offset": "0",
-                        "X-Goog-Upload-Command": "upload, finalize",
-                    },
-                    content=audio_bytes,
-                )
-                if upload_resp.status_code >= 400:
-                    if not _is_retryable_status(upload_resp.status_code):
-                        pass
-                    continue
-                data = upload_resp.json()
-                file_obj = data.get("file", {})
-                file_uri = file_obj.get("uri")
-                used_mime = file_obj.get("mimeType") or mime_type
-                if file_uri:
-                    return file_uri, used_mime, key
-            except Exception:
-                # Network error - try next key
-                continue
-    return None, None, "Failed to upload audio with available API keys"
-
-
-async def transcribe_uploaded_file(file_uri: str, mime_type: str, api_key: str, model: str = "gemini-2.0-flash-exp") -> tuple[Optional[str], Optional[str]]:
     body = {
-        "contents": [{"role": "user", "parts": [{"file_data": {"mime_type": mime_type, "file_uri": file_uri}}, {"text": TRANSCRIBE_PROMPT}]}],
-        "generationConfig": {"maxOutputTokens": 65536, "temperature": 0.0},
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": encoded_audio,
+                        }
+                    },
+                    {"text": TRANSCRIBE_PROMPT},
+                ],
+            }
+        ],
+        "generationConfig": {
+            "maxOutputTokens": 65536,
+            "temperature": 0.0,
+        },
     }
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    body_json = json.dumps(body)
+
+    rotator = KeyRotator(preferred_key=preferred_key)
+    if not rotator.has_keys():
+        return None, "No API keys available"
+
     async with httpx.AsyncClient(timeout=180.0) as client:
-        resp = await client.post(url, headers={"Content-Type": "application/json"}, content=json.dumps(body))
-    if resp.status_code != 200:
-        return None, f"Transcription request failed ({resp.status_code})"
-    text, _ = extract_ai_text(resp.text)
-    clean = (text or "").strip()
-    if not clean or clean in ("No response received from AI.", "Failed to parse AI response."):
-        return None, "Empty transcription result"
-    return clean, None
+        while True:
+            key = rotator.get_next_key()
+            if key is None:
+                break
+
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent?key={key}"
+            )
+            try:
+                resp = await client.post(
+                    url,
+                    content=body_json,
+                    headers={"Content-Type": "application/json"},
+                )
+            except Exception as exc:
+                rotator.mark_failed(key, f"network_error:{exc.__class__.__name__}")
+                continue
+
+            if resp.status_code == 200:
+                rotator.mark_success(key)
+                text, _ = extract_ai_text(resp.text)
+                clean = (text or "").strip()
+                if not clean or clean in (
+                    "No response received from AI.",
+                    "Failed to parse AI response.",
+                ):
+                    return None, "Empty transcription result"
+                return clean, None
+
+            if _is_retryable_status(resp.status_code):
+                rotator.mark_failed(key, f"status_{resp.status_code}")
+                continue
+
+            # Non-retryable — still try other keys
+            rotator.mark_failed(key, f"status_{resp.status_code}")
+
+    return None, f"Transcription failed: {rotator.get_failure_summary()}"

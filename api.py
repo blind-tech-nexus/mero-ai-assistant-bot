@@ -1,14 +1,80 @@
 import json
+import base64
+import logging
 import httpx
+import urllib.parse
 from typing import Optional
 
 from config import CONTEXT_SIZE, USER_MODEL, ADMIN_MODEL, ADMINS
-from api_keys import fetch_api_keys, get_keys
-from database import get_recent_history, save_message, get_user_temp
+from api_keys import fetch_api_keys, KeyRotator
+from database import (
+    get_recent_history, save_message, get_user_temp,
+    save_memory,
+)
 from markdown_parse import markdown_to_html, escape_html
-from message import send_message
+from message import send_message, send_photo, send_chat_action
+
+logger = logging.getLogger("mero.api")
 
 MAX_OUTPUT_TOKENS = 64000
+
+# ---------------------------------------------------------------------------
+# Function declarations for Gemini native function calling
+# ---------------------------------------------------------------------------
+FUNCTION_DECLARATIONS = [
+    {
+        "name": "save_memory",
+        "description": (
+            "Save an important piece of information about the user to long-term memory. "
+            "Use this when the user shares personal details, preferences, goals, birthday, "
+            "name, location, or anything they want remembered across conversations."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "memory": {
+                    "type": "string",
+                    "description": "The information to save as a memory, written as a concise fact.",
+                },
+            },
+            "required": ["memory"],
+        },
+    },
+    {
+        "name": "create_pdf",
+        "description": (
+            "Create a PDF document on a given topic. Use when the user asks to create, "
+            "generate, or make a PDF, document, or report."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "topic": {
+                    "type": "string",
+                    "description": "The topic or subject matter for the PDF document.",
+                },
+            },
+            "required": ["topic"],
+        },
+    },
+    {
+        "name": "generate_image",
+        "description": (
+            "Generate an AI image based on a text prompt. Use when the user asks to generate, "
+            "create, draw, or make an image, picture, illustration, or artwork."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "A detailed description of the image to generate.",
+                },
+            },
+            "required": ["prompt"],
+        },
+    },
+]
 
 
 def get_model_for_user(chat_id: int) -> str:
@@ -19,15 +85,8 @@ def get_model_for_user(chat_id: int) -> str:
 
 
 def _is_retryable_status(status_code: int) -> bool:
-    """Check if the HTTP status code indicates a retryable error (rate limit, quota, server error)."""
+    """Check if the HTTP status code indicates a retryable error."""
     return status_code in (429, 403, 500, 502, 503, 504)
-
-
-def _ordered_keys(preferred_key: Optional[str] = None) -> list[str]:
-    keys = [key for key in get_keys() if key]
-    if preferred_key and preferred_key in keys:
-        return [preferred_key] + [k for k in keys if k != preferred_key]
-    return keys
 
 
 def _normalize_part_keys(part: dict) -> dict:
@@ -79,45 +138,64 @@ def _normalize_parts(parts: list) -> list:
     return normalized
 
 
-async def try_api_call(body_json: str, model: str, preferred_key: Optional[str] = None) -> tuple[Optional[str], Optional[str]]:
-    keys = _ordered_keys(preferred_key)
-    if not keys:
+# ---------------------------------------------------------------------------
+# API call with KeyRotator — proper sequential key iteration
+# ---------------------------------------------------------------------------
+async def try_api_call(
+    body_json: str,
+    model: str,
+    preferred_key: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Try calling Gemini API with proper key rotation using KeyRotator dictionary.
+
+    Iterates through all available keys sequentially:
+      key 1 → if success, return → if fail, try key 2 → ... → until one succeeds.
+    """
+    rotator = KeyRotator(preferred_key=preferred_key)
+    if not rotator.has_keys():
         return None, "No API keys available"
-    failures: list[str] = []
-    last_non_retryable_error: Optional[str] = None
-    
+
     async with httpx.AsyncClient(timeout=120.0) as client:
-        for idx, key in enumerate(keys, start=1):
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+        while True:
+            key = rotator.get_next_key()
+            if key is None:
+                break  # all keys exhausted
+
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent?key={key}"
+            )
             try:
-                resp = await client.post(url, content=body_json, headers={"Content-Type": "application/json"})
+                resp = await client.post(
+                    url,
+                    content=body_json,
+                    headers={"Content-Type": "application/json"},
+                )
             except Exception as exc:
-                # Network error - try next key
-                failures.append(f"key#{idx}: request_error:{exc.__class__.__name__}")
+                rotator.mark_failed(key, f"network_error:{exc.__class__.__name__}")
                 continue
-            
+
             if resp.status_code == 200:
+                rotator.mark_success(key)
                 return resp.text, None
-            
-            # Check if this is a retryable error (rate limit, quota, server error)
+
             if _is_retryable_status(resp.status_code):
-                # This key might work later, but try next key for now
-                failures.append(f"key#{idx}: status_{resp.status_code} (retryable)")
+                rotator.mark_failed(key, f"status_{resp.status_code}")
                 continue
-            
-            # Non-retryable error (e.g., 400 bad request, 401 invalid key)
-            # Don't try other keys if the error is not about rate limiting/quota
-            last_non_retryable_error = f"key#{idx}: status_{resp.status_code}"
-            # Still continue to try other keys in case this key is specifically invalid
-            failures.append(last_non_retryable_error)
-    
-    # All keys exhausted
-    if last_non_retryable_error and not any("(retryable)" in f for f in failures):
-        return None, last_non_retryable_error
-    return None, "; ".join(failures) if failures else "All API keys exhausted"
+
+            # Non-retryable (e.g. 400 bad request) — still try other keys
+            rotator.mark_failed(key, f"status_{resp.status_code}")
+
+    return None, rotator.get_failure_summary()
 
 
-def build_body(history_messages: list[dict], current_parts: list, system_text: str, use_tools: bool = True) -> dict:
+def build_body(
+    history_messages: list[dict],
+    current_parts: list,
+    system_text: str,
+    use_tools: bool = True,
+    use_functions: bool = True,
+) -> dict:
     contents = []
     for msg in history_messages:
         contents.append({
@@ -130,8 +208,14 @@ def build_body(history_messages: list[dict], current_parts: list, system_text: s
         "contents": contents,
         "generationConfig": {"maxOutputTokens": MAX_OUTPUT_TOKENS, "temperature": 1.0},
     }
-    if use_tools:
-        body["tools"] = [{"google_search": {}}, {"url_context": {}}]
+    if use_tools or use_functions:
+        tools: list[dict] = []
+        if use_tools:
+            tools.append({"google_search": {}})
+            tools.append({"url_context": {}})
+        if use_functions:
+            tools.append({"function_declarations": FUNCTION_DECLARATIONS})
+        body["tools"] = tools
     return body
 
 
@@ -139,7 +223,11 @@ def extract_sources(data: dict) -> list[dict]:
     sources: list[dict] = []
     seen: set[str] = set()
     try:
-        for chunk in data.get("candidates", [{}])[0].get("groundingMetadata", {}).get("groundingChunks", []):
+        for chunk in (
+            data.get("candidates", [{}])[0]
+            .get("groundingMetadata", {})
+            .get("groundingChunks", [])
+        ):
             web = chunk.get("web", {})
             uri, title = web.get("uri", ""), web.get("title", "Source")
             if uri and uri not in seen:
@@ -163,15 +251,143 @@ def extract_ai_text(content: str) -> tuple[str, list[dict]]:
     return (ai_text or "No response received from AI."), extract_sources(data)
 
 
+def extract_function_calls(content: str) -> list[dict]:
+    """Extract function calls from a Gemini response.
+
+    Returns a list of dicts with keys: name, args, id (if present).
+    """
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        return []
+    candidates = data.get("candidates", [])
+    if not candidates:
+        return []
+    parts = candidates[0].get("content", {}).get("parts", [])
+    calls = []
+    for part in parts:
+        fc = part.get("functionCall")
+        if fc:
+            calls.append({
+                "name": fc.get("name", ""),
+                "args": fc.get("args", {}),
+                "id": fc.get("id", ""),
+            })
+    return calls
+
+
 def format_response_with_sources(ai_text: str, sources: list[dict]) -> str:
     html = markdown_to_html(ai_text)
     if sources:
         html += "\n\n📌 <b>Sources:</b>\n"
-        html += "".join(f'• <a href="{escape_html(s["url"])}">{escape_html(s["title"])}</a>\n' for s in sources)
+        html += "".join(
+            f'• <a href="{escape_html(s["url"])}">{escape_html(s["title"])}</a>\n'
+            for s in sources
+        )
     return html
 
 
-async def call_gemini_raw(parts: list, system_text: str, model: str = USER_MODEL, preferred_key: Optional[str] = None) -> Optional[str]:
+# ---------------------------------------------------------------------------
+# Function execution — called when Gemini returns functionCall
+# ---------------------------------------------------------------------------
+async def _execute_function(
+    cid: int,
+    name: str,
+    func_name: str,
+    args: dict,
+) -> dict:
+    """Execute a function call locally and return the result."""
+    if func_name == "save_memory":
+        memory_text = args.get("memory", "")
+        if memory_text:
+            save_memory(cid, memory_text)
+            return {"status": "success", "message": f"Memory saved: {memory_text}"}
+        return {"status": "error", "message": "No memory text provided"}
+
+    if func_name == "create_pdf":
+        topic = args.get("topic", "")
+        if topic:
+            from texttopdf import execute_text_to_pdf
+            await execute_text_to_pdf(cid, topic)
+            return {"status": "success", "message": f"PDF created for topic: {topic}"}
+        return {"status": "error", "message": "No topic provided"}
+
+    if func_name == "generate_image":
+        prompt = args.get("prompt", "")
+        if prompt:
+            from image_generation import execute_image
+            await execute_image(cid, prompt, name)
+            return {"status": "success", "message": f"Image generated for: {prompt}"}
+        return {"status": "error", "message": "No prompt provided"}
+
+    return {"status": "error", "message": f"Unknown function: {func_name}"}
+
+
+async def _send_function_response(
+    cid: int,
+    name: str,
+    model: str,
+    body: dict,
+    function_calls: list[dict],
+    preferred_key: Optional[str] = None,
+) -> Optional[str]:
+    """Execute function calls, send results back to Gemini, return final response text."""
+    # Build updated contents with function call and response
+    contents = list(body.get("contents", []))
+
+    # Add the model's function call as a model message
+    fc_parts = []
+    for fc in function_calls:
+        fc_part: dict = {"functionCall": {"name": fc["name"], "args": fc["args"]}}
+        if fc.get("id"):
+            fc_part["functionCall"]["id"] = fc["id"]
+        fc_parts.append(fc_part)
+    contents.append({"role": "model", "parts": fc_parts})
+
+    # Execute each function and build response parts
+    fr_parts = []
+    for fc in function_calls:
+        result = await _execute_function(cid, name, fc["name"], fc["args"])
+        fr_part: dict = {
+            "functionResponse": {
+                "name": fc["name"],
+                "response": result,
+            }
+        }
+        if fc.get("id"):
+            fr_part["functionResponse"]["id"] = fc["id"]
+        fr_parts.append(fr_part)
+    contents.append({"role": "user", "parts": fr_parts})
+
+    # Build new request body with updated contents
+    follow_up = dict(body)
+    follow_up["contents"] = contents
+    # Remove function declarations from follow-up to get a text response
+    # Actually keep them in case the model wants to call another function
+    follow_up_json = json.dumps(follow_up)
+
+    content, err = await try_api_call(follow_up_json, model, preferred_key=preferred_key)
+    if not content:
+        return None
+
+    # Check if model wants to call more functions (max 1 follow-up round)
+    more_calls = extract_function_calls(content)
+    if more_calls:
+        return await _send_function_response(cid, name, model, follow_up, more_calls, preferred_key)
+
+    ai_text, _ = extract_ai_text(content)
+    return ai_text
+
+
+# ---------------------------------------------------------------------------
+# Raw call (used by tools like refiner, translator, pdf)
+# ---------------------------------------------------------------------------
+async def call_gemini_raw(
+    parts: list,
+    system_text: str,
+    model: str = USER_MODEL,
+    preferred_key: Optional[str] = None,
+) -> Optional[str]:
     if not await fetch_api_keys():
         return None
     body = {
@@ -179,42 +395,104 @@ async def call_gemini_raw(parts: list, system_text: str, model: str = USER_MODEL
         "contents": [{"role": "user", "parts": _normalize_parts(parts)}],
         "generationConfig": {"maxOutputTokens": MAX_OUTPUT_TOKENS, "temperature": 0.4},
     }
-    content, err = await try_api_call(json.dumps(body), model, preferred_key=preferred_key)
+    content, err = await try_api_call(
+        json.dumps(body), model, preferred_key=preferred_key
+    )
     if not content:
         return None
     text, _ = extract_ai_text(content)
     return text
 
 
+# ---------------------------------------------------------------------------
+# Main handler — chat with function calling support
+# ---------------------------------------------------------------------------
 async def handle_gemini(
     cid: int,
     current_parts: list,
     system_text: str,
     use_tools: bool = True,
+    use_functions: bool = True,
     preferred_key: Optional[str] = None,
     model: Optional[str] = None,
+    user_name: str = "User",
 ) -> Optional[str]:
-    # Use provided model or determine based on user type
+    """Handle a Gemini request with full function calling support.
+
+    Flow:
+      1. Send request with function declarations
+      2. If response contains functionCall → execute locally → send result back
+      3. Return final text response to user
+    """
     if model is None:
         model = get_model_for_user(cid)
     history = get_recent_history(cid, CONTEXT_SIZE)
-    body = build_body(history, current_parts, system_text, use_tools)
+    body = build_body(history, current_parts, system_text, use_tools, use_functions)
     body["generationConfig"]["temperature"] = get_user_temp(cid)
+
     if not await fetch_api_keys():
         msg = "Could not fetch API keys. Please try again later."
         save_message(cid, "model", msg)
         await send_message(cid, msg)
         return None
-    content, err = await try_api_call(json.dumps(body), model, preferred_key=preferred_key)
+
+    content, err = await try_api_call(
+        json.dumps(body), model, preferred_key=preferred_key
+    )
+
     if content:
+        # Check for function calls first
+        function_calls = extract_function_calls(content)
+        if function_calls:
+            # Notify user that we're processing
+            for fc in function_calls:
+                fn = fc["name"]
+                if fn == "save_memory":
+                    await send_chat_action(cid, "typing")
+                elif fn == "create_pdf":
+                    await send_chat_action(cid, "upload_document")
+                elif fn == "generate_image":
+                    await send_chat_action(cid, "upload_photo")
+
+            # Execute functions and get final response
+            final_text = await _send_function_response(
+                cid, user_name, model, body, function_calls, preferred_key
+            )
+            if final_text:
+                save_message(cid, "model", final_text)
+                if final_text not in (
+                    "No response received from AI.",
+                    "Failed to parse AI response.",
+                ):
+                    formatted = format_response_with_sources(final_text, [])
+                    await send_message(cid, formatted, parse_mode="HTML")
+                else:
+                    await send_message(cid, final_text)
+                return final_text
+            # If function response failed, try to extract text from original response
+            ai_text, sources = extract_ai_text(content)
+            if ai_text not in (
+                "No response received from AI.",
+                "Failed to parse AI response.",
+            ):
+                save_message(cid, "model", ai_text)
+                formatted = format_response_with_sources(ai_text, sources)
+                await send_message(cid, formatted, parse_mode="HTML")
+                return ai_text
+
+        # No function calls — normal text response
         ai_text, sources = extract_ai_text(content)
         save_message(cid, "model", ai_text)
-        if ai_text not in ("No response received from AI.", "Failed to parse AI response."):
+        if ai_text not in (
+            "No response received from AI.",
+            "Failed to parse AI response.",
+        ):
             formatted = format_response_with_sources(ai_text, sources)
             await send_message(cid, formatted, parse_mode="HTML")
         else:
             await send_message(cid, ai_text)
         return ai_text
+
     error = f"Error: {err or 'Unknown error occurred'}"
     save_message(cid, "model", error)
     await send_message(cid, error)
