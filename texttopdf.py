@@ -9,7 +9,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer
 
-from api import call_gemini_raw, get_model_for_user
+from api import call_gemini_raw, get_gemini_model
 from message import send_document_bytes, send_message
 
 
@@ -100,14 +100,14 @@ def render_pdf(doc: PdfDocument) -> bytes:
     styles = getSampleStyleSheet()
 
     title_style = ParagraphStyle(
-        "DailyAICompanionTitle",
+        "NepoAICompanionTitle",
         parent=styles["Heading2"],
         fontSize=16,
         leading=20,
         spaceAfter=10,
     )
     para_style = ParagraphStyle(
-        "DailyAICompanionParagraph",
+        "NepoAICompanionParagraph",
         parent=styles["BodyText"],
         fontSize=11,
         leading=16,
@@ -135,9 +135,6 @@ def render_pdf(doc: PdfDocument) -> bytes:
 async def execute_text_to_pdf(cid: int, prompt: str) -> None:
     await send_message(cid, "📄 Creating your PDF document...")
 
-    # Use appropriate model based on user type
-    model = get_model_for_user(cid)
-
     system_text = (
         "Create PDF-ready content as clean XML-like markup. "
         "Return clean markup in this style:\n"
@@ -152,7 +149,7 @@ async def execute_text_to_pdf(cid: int, prompt: str) -> None:
         "Search the web when needed, and return only <page>...</page> content with <text> and <paragraph>."
     )
 
-    raw = await call_gemini_raw([{"text": user_prompt}], system_text, model=model)
+    raw = await call_gemini_raw(cid, [{"text": user_prompt}], system_text)
     if not raw:
         await send_message(cid, "❌ Failed to generate PDF content. Please try again.")
         return
@@ -167,7 +164,7 @@ async def execute_text_to_pdf(cid: int, prompt: str) -> None:
     await send_document_bytes(
         cid,
         pdf_bytes,
-        "mero_document.pdf",
+        "nepo_document.pdf",
         "✅ Your PDF is ready.",
         mime_type="application/pdf",
     )

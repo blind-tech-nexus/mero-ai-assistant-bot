@@ -5,7 +5,7 @@ def get_system_text(name: str, chat_id: int) -> str:
     memories = get_memories(chat_id)
     formatted_memories = "\n".join(f"- {m}" for m in memories) if memories else "- (none)"
     base = (
-        f"You're Daily AI Companion assistant developed by Sujan Rai. "
+        f"You're Nepo AI companion assistant developed by Sujan Rai. "
         f"User's name: {name}. "
         f"Capabilities: You have powerful tools at your disposal. "
         f"You can save important information to memory using the save_memory tool. "

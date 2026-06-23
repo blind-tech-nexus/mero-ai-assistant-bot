@@ -3,8 +3,12 @@ import os
 BOT_TOKEN = os.environ.get("bot_token")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 POOL_API = "https://sr-pool-api-5bm.pages.dev"
-USER_MODEL = "gemini-2.5-flash"
-ADMIN_MODEL = "gemini-2.5-flash"
+
+# Models
+MODEL_LITE = "gemini-2.5-flash"
+MODEL_SMART = "gemini-3-flash-preview"
+DEFAULT_MODEL = "nepo-lite"
+
 ADMINS = [7026190306, 6280547580]
 MICROSOFT_TTS_API = "https://multi-functional-api-sujan.vercel.app/tts/Microsoft"
 DEFAULT_TTS_VOICE = "en-US-AriaNeural"
@@ -14,7 +18,7 @@ BOT_MENTION_ALIASES = [a.strip() for a in os.environ.get("BOT_MENTION_ALIASES", 
 MAX_HISTORY = 1000
 CONTEXT_SIZE = 50
 
-SHARE_TEXT = "🚀 Check out Daily AI Companion — your free, fast & powerful AI companion on Telegram!\n\nhttps://t.me/meroaiassistantbot_bot"
+SHARE_TEXT = "🚀 Check out Nepo AI companion — your free, fast & powerful AI companion on Telegram!\n\nhttps://t.me/meroaiassistantbot_bot"
 
 TEMPLATE_PROMPTS = [
     "Explain quantum computing simply",

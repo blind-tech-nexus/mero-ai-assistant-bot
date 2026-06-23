@@ -40,7 +40,7 @@ def user_exists(uid: int) -> bool:
 
 def remove_all_user_data(uid: int) -> None:
     r.delete(hk(uid), rsk(uid), sk(uid), fk(uid), mk(uid), ck(uid))
-    r.delete(f"settings:{uid}:system", f"settings:{uid}:voice", f"settings:{uid}:temp")
+    r.delete(f"settings:{uid}:system", f"settings:{uid}:voice", f"settings:{uid}:temp", f"settings:{uid}:model")
     r.hdel("totalUsers", str(uid))
 
 
@@ -183,6 +183,15 @@ def set_user_temp(cid: int, temp: float) -> None:
     r.set(f"settings:{cid}:temp", str(temp))
 
 
+def get_user_model(cid: int) -> str:
+    from config import DEFAULT_MODEL
+    return r.get(f"settings:{cid}:model") or DEFAULT_MODEL
+
+
+def set_user_model(cid: int, model: str) -> None:
+    r.set(f"settings:{cid}:model", model)
+
+
 def ensure_user(cid: int, name: str) -> None:
     if not user_exists(cid):
         save_user(cid, name)
@@ -197,7 +206,7 @@ def check_banned(cid: int) -> bool:
     return is_banned(cid) and not is_admin(cid)
 
 def get_credit_message() -> str:
-    return r.get("settings:credit_message") or "Developer: Daily AI Companion Team\nCredits: Thanks for using Daily AI Companion."
+    return r.get("settings:credit_message") or "Developer: Nepo AI companion Team\nCredits: Thanks for using Nepo AI companion."
 
 
 def set_credit_message(text: str) -> None:

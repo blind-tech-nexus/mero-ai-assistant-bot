@@ -34,7 +34,7 @@ def template_prompts_keyboard() -> dict:
 def user_settings_keyboard() -> dict:
     return ikb([
         [btn("🧠 System Instructions", "set_system"), btn("🎙️ TTS Voice", "set_voice")],
-        [btn("🌡️ Temperature", "set_temp")],
+        [btn("🌡️ Temperature", "set_temp"), btn("🤖 AI Model", "set_model")],
         [btn("🧠 Memory", "memory_settings")],
         [btn("🧰 Tools", "open_tools")],
         [btn("🗑️ Clear Chat", "clear"), btn("🧹 Clear Attachment", "cls")],
@@ -48,7 +48,7 @@ def user_settings_keyboard() -> dict:
 def admin_settings_keyboard() -> dict:
     return ikb([
         [btn("🧠 System Instructions", "set_system"), btn("🎙️ TTS Voice", "set_voice")],
-        [btn("🌡️ Temperature", "set_temp")],
+        [btn("🌡️ Temperature", "set_temp"), btn("🤖 AI Model", "set_model")],
         [btn("🧠 Memory", "memory_settings")],
         [btn("🧰 Tools", "open_tools")],
         [btn("🗑️ Clear Chat", "clear"), btn("🧹 Clear Attachment", "cls")],
@@ -114,6 +114,13 @@ def temp_keyboard() -> dict:
     ])
 
 
+def model_keyboard() -> dict:
+    return ikb([
+        [btn("⚡ Nepo Lite (Fast)", "model:nepo-lite"), btn("🧠 Nepo Smart (Advanced)", "model:nepo-smart")],
+        [btn("🔙 Back", "back_settings")],
+    ])
+
+
 def photo_keyboard() -> dict:
     return ikb([
         [btn("📝 Describe", "describe_photo")],
@@ -137,7 +144,6 @@ def admin_user_reply_keyboard(target: int, username: str = "User") -> dict:
 
 def broadcast_reply_keyboard() -> dict:
     return ikb([[btn("💬 Reply to Admin", "feedback_prompt")]])
-
 
 
 def tools_keyboard() -> dict:

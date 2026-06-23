@@ -1,6 +1,7 @@
 import httpx
 import logging
 import time
+import asyncio
 from typing import Optional
 from config import POOL_API
 
@@ -8,14 +9,16 @@ logger = logging.getLogger("mero.api_keys")
 
 # Global variables to store API keys and their statuses across request cycles
 api_keys: list[str] = []
-key_status: dict[str, str] = {}  # key -> "unused" | "success" | "failed"
 LAST_FETCH_TIME: float = 0
 CACHE_TTL = 300  # 5 minutes cache
+
+_key_index = 0
+_key_lock = asyncio.Lock()
 
 
 async def fetch_api_keys() -> bool:
     """Fetch API keys from the pool API and update the global tracker with caching."""
-    global api_keys, key_status, LAST_FETCH_TIME
+    global api_keys, LAST_FETCH_TIME
     current_time = time.time()
 
     # Return cached keys if available and fresh
@@ -31,20 +34,7 @@ async def fetch_api_keys() -> bool:
                     new_keys = [k for k in keys if k and isinstance(k, str)]
                     api_keys = new_keys
                     LAST_FETCH_TIME = current_time
-
-                    # Sync global status dictionary
-                    updated_status = {}
-                    for k in new_keys:
-                        # Retain existing status if key was already present
-                        updated_status[k] = key_status.get(k, "unused")
-                    key_status = updated_status
-
-                    # If all keys are marked "failed", reset them to "unused" to avoid lockouts
-                    if new_keys and all(key_status[k] == "failed" for k in new_keys):
-                        for k in key_status:
-                            key_status[k] = "unused"
-
-                    logger.info("Fetched %d api keys. Status tracker updated.", len(api_keys))
+                    logger.info("Fetched %d api keys.", len(api_keys))
                     return bool(api_keys)
     except Exception as exc:
         logger.warning("fetch_api_keys failed: %s", exc)
@@ -53,105 +43,48 @@ async def fetch_api_keys() -> bool:
     return bool(api_keys)
 
 
-def get_keys() -> list[str]:
-    """Get the current list of API keys, ensuring they are tracked in key_status."""
-    global key_status
-    for k in api_keys:
-        if k not in key_status:
-            key_status[k] = "unused"
-    return api_keys
+async def get_next_key_index() -> int:
+    """Return and advance the global round-robin index."""
+    global _key_index
+    async with _key_lock:
+        if not api_keys:
+            return 0
+        idx = _key_index
+        _key_index = (_key_index + 1) % len(api_keys)
+        return idx
 
 
 class KeyRotator:
-    """Manages sequential key iteration and state tracking for a single request sequence."""
-
-    def __init__(self, preferred_key: Optional[str] = None):
-        # Ensure status dictionary has all current keys initialized
-        all_keys = list(get_keys())
-
-        # If all keys are failed, reset them to unused to avoid lockout
-        if all_keys and all(key_status.get(k) == "failed" for k in all_keys):
-            for k in all_keys:
-                key_status[k] = "unused"
-
-        # Group keys by their global status
-        success_keys = [k for k in all_keys if key_status.get(k) == "success"]
-        unused_keys = [k for k in all_keys if key_status.get(k) == "unused"]
-        failed_keys = [k for k in all_keys if key_status.get(k) == "failed"]
-
-        # Order of execution: preferred key -> success keys -> unused keys -> failed keys (fallback)
-        order = []
-        if preferred_key and preferred_key in all_keys:
-            order.append(preferred_key)
-
-        for k in success_keys:
-            if k not in order:
-                order.append(k)
-        for k in unused_keys:
-            if k not in order:
-                order.append(k)
-        for k in failed_keys:
-            if k not in order:
-                order.append(k)
-
-        self._keys_to_try = order
-        self._tried_in_request = set()
-        self._current_index = 0
-        self._failures = []
-
-    @property
-    def total_keys(self) -> int:
-        return len(self._keys_to_try)
-
-    @property
-    def tried_keys(self) -> dict[str, str]:
-        # Return a copy of global key_status for debugging/logging
-        return dict(key_status)
-
-    @property
-    def remaining_keys(self) -> list[str]:
-        return [k for k in self._keys_to_try if k not in self._tried_in_request]
+    def __init__(self, start_idx: int):
+        self._keys = list(api_keys)
+        self._start_idx = start_idx
+        self._tried = 0
 
     def get_next_key(self) -> Optional[str]:
-        """Return the next untried API key for this request cycle. Never repeats keys."""
-        while self._current_index < len(self._keys_to_try):
-            key = self._keys_to_try[self._current_index]
-            self._current_index += 1
-            if key not in self._tried_in_request:
-                self._tried_in_request.add(key)
-                return key
-        return None
+        if not self._keys or self._tried >= len(self._keys):
+            return None
+        idx = (self._start_idx + self._tried) % len(self._keys)
+        self._tried += 1
+        return self._keys[idx]
 
-    def mark_success(self, key: str) -> None:
-        """Mark a key as successfully working globally."""
-        global key_status
-        if key in key_status:
-            key_status[key] = "success"
-        logger.info("API Key succeeded: %s...%s", key[:6] if len(key) > 6 else "", key[-4:] if len(key) > 4 else "")
 
-    def mark_failed(self, key: str, reason: str = "") -> None:
-        """Mark a key as failed globally."""
-        global key_status
-        if key in key_status:
-            key_status[key] = "failed"
-
-        idx = api_keys.index(key) + 1 if key in api_keys else 0
-        failure_msg = f"key#{idx}: {reason}" if reason else f"key#{idx}: failed"
-        self._failures.append(failure_msg)
-        logger.warning(
-            "API Key failed: %s...%s (index: %d) Reason: %s",
-            key[:6] if len(key) > 6 else "",
-            key[-4:] if len(key) > 4 else "",
-            idx,
-            reason,
-        )
-
-    def get_failure_summary(self) -> str:
-        """Return a formatted string summarizing the failures of all tried keys."""
-        if not self._failures:
-            return "No keys tried or available"
-        return "; ".join(self._failures)
-
-    def has_keys(self) -> bool:
-        """Return True if there is at least one key available to try."""
-        return len(self._keys_to_try) > 0
+def is_retriable_error(e: Exception) -> bool:
+    err_str = str(e).lower()
+    non_retriable = {"400", "401", "403", "404", "invalid", "permission",
+                     "denied", "malformed", "bad request", "safety"}
+    if any(c in err_str for c in non_retriable):
+        return False
+    retriable = {"429", "500", "502", "503", "504", "resource_exhausted",
+                 "unavailable", "connection", "timeout", "deadline"}
+    if any(c in err_str for c in retriable):
+        return True
+    if hasattr(e, "code"):
+        code = getattr(e, "code", None)
+        if code in (400, 401, 403, 404):
+            return False
+        if code in (429, 500, 502, 503, 504):
+            return True
+    if isinstance(e, (httpx.HTTPStatusError, httpx.ConnectError,
+                      httpx.TimeoutException, httpx.NetworkError)):
+        return True
+    return False

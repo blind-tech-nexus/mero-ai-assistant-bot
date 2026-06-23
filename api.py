@@ -5,11 +5,11 @@ import httpx
 import urllib.parse
 from typing import Optional
 
-from config import CONTEXT_SIZE, USER_MODEL, ADMIN_MODEL, ADMINS
-from api_keys import fetch_api_keys, KeyRotator
+from config import CONTEXT_SIZE, MODEL_LITE, MODEL_SMART
+from api_keys import fetch_api_keys, get_next_key_index, KeyRotator, is_retriable_error
 from database import (
     get_recent_history, save_message, get_user_temp,
-    save_memory,
+    save_memory, get_user_model,
 )
 from markdown_parse import markdown_to_html, escape_html
 from message import send_message, send_photo, send_chat_action
@@ -77,16 +77,12 @@ FUNCTION_DECLARATIONS = [
 ]
 
 
-def get_model_for_user(chat_id: int) -> str:
-    """Return the appropriate model based on whether the user is an admin."""
-    if chat_id in ADMINS:
-        return ADMIN_MODEL
-    return USER_MODEL
-
-
-def _is_retryable_status(status_code: int) -> bool:
-    """Check if the HTTP status code indicates a retryable error."""
-    return status_code in (429, 403, 500, 502, 503, 504)
+def get_gemini_model(chat_id: int) -> str:
+    """Return the appropriate model based on user settings."""
+    m = get_user_model(chat_id)
+    if m == "nepo-smart":
+        return MODEL_SMART
+    return MODEL_LITE
 
 
 GEMINI_SUPPORTED_MIMES = {
@@ -163,22 +159,23 @@ def _normalize_parts(parts: list) -> list:
 async def try_api_call(
     body_json: str,
     model: str,
-    preferred_key: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[str]]:
-    """Try calling Gemini API with proper key rotation using KeyRotator dictionary.
-
-    Iterates through all available keys sequentially:
-      key 1 → if success, return → if fail, try key 2 → ... → until one succeeds.
-    """
-    rotator = KeyRotator(preferred_key=preferred_key)
-    if not rotator.has_keys():
+    """Try calling Gemini API with proper key rotation using KeyRotator."""
+    if not await fetch_api_keys():
         return None, "No API keys available"
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    start_idx = await get_next_key_index()
+    rotator = KeyRotator(start_idx)
+
+    last_error = None
+    async with httpx.AsyncClient(
+        timeout=120.0,
+        limits=httpx.Limits(max_connections=500, max_keepalive_connections=100)
+    ) as client:
         while True:
             key = rotator.get_next_key()
             if key is None:
-                break  # all keys exhausted
+                break
 
             url = (
                 f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -190,19 +187,21 @@ async def try_api_call(
                     content=body_json,
                     headers={"Content-Type": "application/json"},
                 )
+                if resp.status_code == 200:
+                    return resp.text, None
+
+                logger.warning("API call failed with status %d: %s", resp.status_code, resp.text)
+                last_error = f"Status {resp.status_code}: {resp.text}"
+                if not is_retriable_error(httpx.HTTPStatusError(message="", request=None, response=resp)):
+                    break
             except Exception as exc:
-                rotator.mark_failed(key, f"network_error:{exc.__class__.__name__}")
+                logger.warning("API call exception: %s", exc)
+                last_error = str(exc)
+                if not is_retriable_error(exc):
+                    break
                 continue
 
-            if resp.status_code == 200:
-                rotator.mark_success(key)
-                return resp.text, None
-
-            logger.warning("API call failed with status %d: %s", resp.status_code, resp.text)
-            rotator.mark_failed(key, f"status_{resp.status_code}")
-            continue
-
-    return None, rotator.get_failure_summary()
+    return None, last_error or "All keys exhausted"
 
 
 def build_body(
@@ -375,7 +374,6 @@ async def _send_function_response(
     model: str,
     body: dict,
     function_calls: list[dict],
-    preferred_key: Optional[str] = None,
 ) -> Optional[str]:
     """Execute function calls, send results back to Gemini, return final response text."""
     # Build updated contents with function call and response
@@ -406,14 +404,14 @@ async def _send_function_response(
     follow_up["contents"] = contents
     follow_up_json = json.dumps(follow_up)
 
-    content, err = await try_api_call(follow_up_json, model, preferred_key=preferred_key)
+    content, err = await try_api_call(follow_up_json, model)
     if not content:
         return None
 
     # Check if model wants to call more functions (max 1 follow-up round)
     more_calls = extract_function_calls(content)
     if more_calls:
-        return await _send_function_response(cid, name, model, follow_up, more_calls, preferred_key)
+        return await _send_function_response(cid, name, model, follow_up, more_calls)
 
     ai_text, _ = extract_ai_text(content)
     return ai_text
@@ -423,20 +421,20 @@ async def _send_function_response(
 # Raw call (used by tools like refiner, translator, pdf)
 # ---------------------------------------------------------------------------
 async def call_gemini_raw(
+    cid: int,
     parts: list,
     system_text: str,
-    model: str = USER_MODEL,
-    preferred_key: Optional[str] = None,
 ) -> Optional[str]:
     if not await fetch_api_keys():
         return None
+    model = get_gemini_model(cid)
     body = {
         "system_instruction": {"parts": [{"text": system_text}]},
         "contents": [{"role": "user", "parts": _normalize_parts(parts)}],
         "generationConfig": {"maxOutputTokens": MAX_OUTPUT_TOKENS, "temperature": 0.4},
     }
     content, err = await try_api_call(
-        json.dumps(body), model, preferred_key=preferred_key
+        json.dumps(body), model
     )
     if not content:
         return None
@@ -453,8 +451,6 @@ async def handle_gemini(
     system_text: str,
     use_tools: bool = True,
     use_functions: bool = True,
-    preferred_key: Optional[str] = None,
-    model: Optional[str] = None,
     user_name: str = "User",
 ) -> Optional[str]:
     """Handle a Gemini request with full function calling support.
@@ -464,8 +460,7 @@ async def handle_gemini(
       2. If response contains functionCall → execute locally → send result back
       3. Return final text response to user
     """
-    if model is None:
-        model = get_model_for_user(cid)
+    model = get_gemini_model(cid)
     history = get_recent_history(cid, CONTEXT_SIZE)
     body = build_body(history, current_parts, system_text, use_tools, use_functions)
     body["generationConfig"]["temperature"] = get_user_temp(cid)
@@ -477,7 +472,7 @@ async def handle_gemini(
         return None
 
     content, err = await try_api_call(
-        json.dumps(body), model, preferred_key=preferred_key
+        json.dumps(body), model
     )
 
     if content:
@@ -496,7 +491,7 @@ async def handle_gemini(
 
             # Execute functions and get final response
             final_text = await _send_function_response(
-                cid, user_name, model, body, function_calls, preferred_key
+                cid, user_name, model, body, function_calls
             )
             if final_text:
                 save_message(cid, "model", final_text)

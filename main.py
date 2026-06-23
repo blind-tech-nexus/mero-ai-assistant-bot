@@ -14,6 +14,7 @@ from database import (
     get_credit_message, set_credit_message,
     get_memories, save_memory, clear_memories,
     ensure_user, is_admin, check_banned,
+    get_user_model, set_user_model,
 )
 from message import (
     send_message, send_photo, send_voice_bytes,
@@ -25,7 +26,7 @@ from settings import (
     btn, url_btn, ikb,
     start_keyboard, template_prompts_keyboard,
     user_settings_keyboard, admin_settings_keyboard,
-    voice_keyboard, temp_keyboard, photo_keyboard, file_prompt_keyboard, language_name,
+    voice_keyboard, temp_keyboard, model_keyboard, photo_keyboard, file_prompt_keyboard, language_name,
     admin_reply_keyboard, admin_user_reply_keyboard, broadcast_reply_keyboard,
     share_keyboard,
 )
@@ -187,7 +188,7 @@ def _copy_broadcast_message_sync(target: int, source_chat_id: int, source_messag
 def _run_parallel_broadcast(users: list[int], sender) -> tuple[int, int, list[int]]:
     success, fail = 0, 0
     failed_ids: list[int] = []
-    with ThreadPoolExecutor(max_workers=20) as executor:
+    with ThreadPoolExecutor(max_workers=50) as executor:
         futures = {executor.submit(sender, target): target for target in users}
         for future in as_completed(futures):
             target = futures[future]
@@ -205,7 +206,7 @@ def _run_parallel_broadcast(users: list[int], sender) -> tuple[int, int, list[in
 
 @app.get("/")
 async def home():
-    return {"status": "ok", "message": "Daily AI Companion is running!"}
+    return {"status": "ok", "message": "Nepo AI companion is running!"}
 
 
 @app.post("/webhook")
@@ -238,7 +239,7 @@ async def webhook(request: Request):
                 await answer_callback(cb_id)
                 await send_message(
                     cid,
-                    f"📤 <b>Share Daily AI Companion with your friends!</b>\n\n{escape_html(SHARE_TEXT)}",
+                    f"📤 <b>Share Nepo AI companion with your friends!</b>\n\n{escape_html(SHARE_TEXT)}",
                     parse_mode="HTML",
                     reply_markup=share_keyboard(),
                 )
@@ -375,8 +376,6 @@ async def webhook(request: Request):
                 await edit_message(cid, mid, "✅ Attachment cancelled.")
                 return JSONResponse({"ok": True})
 
-
-
             if cb_data == "export_chat":
                 await answer_callback(cb_id)
                 history = get_all_history(cid)
@@ -385,7 +384,7 @@ async def webhook(request: Request):
                     return JSONResponse({"ok": True})
                 export_lines = []
                 for msg in history:
-                    role = "You" if msg["role"] == "user" else "Daily AI Companion"
+                    role = "You" if msg["role"] == "user" else "Nepo AI companion"
                     export_lines.append(f"[{role}]\n{msg.get('text', '')}\n")
                 export_text = "\n---\n".join(export_lines)
                 file_bytes = export_text.encode("utf-8")
@@ -466,7 +465,6 @@ async def webhook(request: Request):
                 await edit_message(cid, mid, "⚙️ <b>Settings</b>", parse_mode="HTML", reply_markup=kb)
                 return JSONResponse({"ok": True})
 
-
             if cb_data == "developer_credits":
                 await answer_callback(cb_id)
                 credit_message = get_credit_message()
@@ -496,6 +494,7 @@ async def webhook(request: Request):
                 set_state(cid, "awaiting_credit_message")
                 await send_message(cid, "✍️ Send the new developer and credits message:", reply_markup=ikb([[btn("❌ Cancel", "cancel_reply")]]))
                 return JSONResponse({"ok": True})
+
             if cb_data == "set_system":
                 await answer_callback(cb_id)
                 current = get_user_system(cid)
@@ -577,6 +576,30 @@ async def webhook(request: Request):
                 set_user_temp(cid, temp_val)
                 await answer_callback(cb_id, f"Temperature: {temp_val}")
                 await edit_message(cid, mid, f"✅ Temperature set to <code>{temp_val}</code>", parse_mode="HTML", reply_markup=ikb([[btn("🔙 Back", "back_settings")]]))
+                return JSONResponse({"ok": True})
+
+            if cb_data == "set_model":
+                await answer_callback(cb_id)
+                current_model = get_user_model(cid)
+                await edit_message(
+                    cid, mid,
+                    f"🤖 <b>AI Model Selection</b>\n\nCurrent model: <code>{current_model}</code>\n\nSelect a model:",
+                    parse_mode="HTML",
+                    reply_markup=model_keyboard(),
+                )
+                return JSONResponse({"ok": True})
+
+            if cb_data.startswith("model:"):
+                model_name = cb_data.split(":", 1)[1]
+                set_user_model(cid, model_name)
+                await answer_callback(cb_id, f"Model set: {model_name}")
+                await edit_message(
+                    cid,
+                    mid,
+                    f"✅ AI model changed to <code>{model_name}</code>",
+                    parse_mode="HTML",
+                    reply_markup=ikb([[btn("🔙 Back", "back_settings")]]),
+                )
                 return JSONResponse({"ok": True})
 
             if cb_data.startswith("reply_admin:"):
@@ -704,9 +727,14 @@ async def webhook(request: Request):
         group_prompt = None
         if is_group_chat(message):
             group_prompt = extract_group_prompt(message)
-            if not group_prompt:
+            if group_prompt is None:
                 return JSONResponse({"ok": True})
-            message["text"] = group_prompt
+            if "text" in message:
+                message["text"] = group_prompt
+            elif "caption" in message:
+                message["caption"] = group_prompt
+            else:
+                message["text"] = group_prompt
 
         if check_banned(cid):
             await send_banned_message(cid)
@@ -720,8 +748,8 @@ async def webhook(request: Request):
                 _set_broadcast_failed(cid, failed_ids)
             return JSONResponse({"ok": True})
 
-        if st and "text" in message:
-            text = message["text"].strip()
+        if st and ("text" in message or "caption" in message):
+            text = (message.get("text") or message.get("caption") or "").strip()
 
             if text.startswith("/"):
                 clear_state(cid)
@@ -950,10 +978,10 @@ async def webhook(request: Request):
             save_user(cid, name)
             clear_history(cid)
             welcome = (
-                f"👋 <b>Hi {escape_html(name)}, Welcome to Daily AI Companion!</b>\n\n"
-                f"🤖 <b>Daily AI Companion</b> is your intelligent AI assistant, optimized with advanced large language models "
+                f"👋 <b>Hi {escape_html(name)}, Welcome to Nepo AI companion!</b>\n\n"
+                f"🤖 <b>Nepo AI companion</b> is your intelligent AI assistant, optimized with advanced large language models "
                 f"to deliver fast, accurate, and context-aware responses.\n\n"
-                f"<b>Here's what Daily AI Companion can do for you:</b>\n\n"
+                f"<b>Here's what Nepo AI companion can do for you:</b>\n\n"
                 f"💬 <b>Natural Conversations</b> — Chat naturally on any topic\n"
                 f"🌐 <b>Real-time Web Search</b> — Get the most up-to-date information\n"
                 f"🎬 <b>YouTube Analysis</b> — Transcribe, summarize &amp; analyze videos\n"
@@ -967,13 +995,13 @@ async def webhook(request: Request):
                 f"🌍 <b>Translation</b> — Translate between languages effortlessly\n"
                 f"📊 <b>Math &amp; Science</b> — Solve complex problems step by step\n"
                 f"📖 <b>Summarization</b> — Condense long texts into key points\n"
-                f"🧠 <b>Memory</b> — Daily AI Companion remembers your conversations for contextual responses\n"
+                f"🧠 <b>Memory</b> — Nepo AI companion remembers your conversations for contextual responses\n"
                 f"📋 <b>Custom Instructions</b> — Set system instructions for personalized behavior\n"
-                f"🎙️ <b>Voice Responses</b> — Daily AI Companion can reply with voice in many languages\n\n"
+                f"🎙️ <b>Voice Responses</b> — Nepo AI companion can reply with voice in many languages\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"Daily AI Companion is <b>fast, free, and powerful</b>. With its agentic workflow, "
+                f"Nepo AI companion is <b>fast, free, and powerful</b>. With its agentic workflow, "
                 f"it understands your intent and routes your requests intelligently.\n\n"
-                f"🙏 <i>Thank you for using Daily AI Companion! If you love it, share it with your friends.</i>"
+                f"🙏 <i>Thank you for using Nepo AI companion! If you love it, share it with your friends.</i>"
             )
             await send_message(cid, welcome, parse_mode="HTML", reply_markup=start_keyboard())
             await send_message(
@@ -1018,8 +1046,6 @@ async def webhook(request: Request):
                 parse_mode="HTML",
             )
             return JSONResponse({"ok": True})
-
-
 
         if text == "/total":
             if not is_admin(cid):
@@ -1117,7 +1143,7 @@ async def webhook(request: Request):
             ensure_user(cid, name)
             if is_admin(cid):
                 help_text = (
-                    "📖 <b>Daily AI Companion Admin Help</b>\n\n"
+                    "📖 <b>Nepo AI companion Admin Help</b>\n\n"
                     "<b>Admin Commands</b>\n"
                     "/total — View all users\n"
                     "/sendMessage &lt;id&gt; - &lt;text&gt; — Message a user\n"
@@ -1137,7 +1163,7 @@ async def webhook(request: Request):
                 )
             else:
                 help_text = (
-                    "📖 <b>Daily AI Companion User Help</b>\n\n"
+                    "📖 <b>Nepo AI companion User Help</b>\n\n"
                     "<b>User Commands</b>\n"
                     "/start — Restart and reset your session\n"
                     "/settings — Open settings\n"
@@ -1182,7 +1208,7 @@ async def webhook(request: Request):
         if not user_exists(cid):
             save_user(cid, name)
             welcome = (
-                f"👋 <b>Hi {escape_html(name)}, Welcome to Daily AI Companion!</b>\n\n"
+                f"👋 <b>Hi {escape_html(name)}, Welcome to Nepo AI companion!</b>\n\n"
                 f"Send /start for the full introduction, or just keep chatting!"
             )
             await send_message(cid, welcome, parse_mode="HTML", reply_markup=start_keyboard())

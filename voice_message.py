@@ -26,7 +26,7 @@ async def handle_voice(cid: int, voice: dict, name: str) -> None:
         await send_message(cid, "❌ Failed to download voice message.")
         return
     mime_type = _voice_mime_type(voice)
-    transcription, _ = await transcribe_audio_bytes(voice_data, mime_type, "voice.ogg")
+    transcription, _ = await transcribe_audio_bytes(voice_data, mime_type, "voice.ogg", chat_id=cid)
     transcription_text = (transcription or "").strip()
     if not transcription_text or transcription_text in ("No response received from AI.", "Failed to parse AI response."):
         await send_message(cid, "❌ Failed to transcribe voice message.")
