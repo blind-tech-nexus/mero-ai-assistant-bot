@@ -110,31 +110,31 @@ def _normalize_part_keys(part: dict) -> dict:
     if "file_data" in part and isinstance(part["file_data"], dict):
         fd = part["file_data"]
         normalized = _compact({
-            "mime_type": normalize_mime_type(fd.get("mime_type") or fd.get("mimeType")),
-            "file_uri": fd.get("file_uri") or fd.get("fileUri"),
+            "mimeType": normalize_mime_type(fd.get("mime_type") or fd.get("mimeType")),
+            "fileUri": fd.get("file_uri") or fd.get("fileUri"),
         })
-        return {"file_data": normalized} if normalized else {}
+        return {"fileData": normalized} if normalized else {}
     if "fileData" in part and isinstance(part["fileData"], dict):
         fd = part["fileData"]
         normalized = _compact({
-            "mime_type": normalize_mime_type(fd.get("mimeType")),
-            "file_uri": fd.get("fileUri"),
+            "mimeType": normalize_mime_type(fd.get("mimeType")),
+            "fileUri": fd.get("fileUri"),
         })
-        return {"file_data": normalized} if normalized else {}
+        return {"fileData": normalized} if normalized else {}
     if "inline_data" in part and isinstance(part["inline_data"], dict):
         ind = part["inline_data"]
         normalized = _compact({
-            "mime_type": normalize_mime_type(ind.get("mime_type") or ind.get("mimeType")),
+            "mimeType": normalize_mime_type(ind.get("mime_type") or ind.get("mimeType")),
             "data": ind.get("data"),
         })
-        return {"inline_data": normalized} if normalized else {}
+        return {"inlineData": normalized} if normalized else {}
     if "inlineData" in part and isinstance(part["inlineData"], dict):
         ind = part["inlineData"]
         normalized = _compact({
-            "mime_type": normalize_mime_type(ind.get("mimeType")),
+            "mimeType": normalize_mime_type(ind.get("mimeType")),
             "data": ind.get("data"),
         })
-        return {"inline_data": normalized} if normalized else {}
+        return {"inlineData": normalized} if normalized else {}
     if "text" in part:
         text_val = (part.get("text") or "").strip()
         return {"text": text_val} if text_val else {}
@@ -250,7 +250,7 @@ def build_body(
             alternating_contents.append({"role": "user", "parts": [{"text": "Hello"}]})
 
     body: dict = {
-        "system_instruction": {"parts": [{"text": system_text}]},
+        "systemInstruction": {"parts": [{"text": system_text}]},
         "contents": alternating_contents,
         "generationConfig": {"maxOutputTokens": MAX_OUTPUT_TOKENS, "temperature": 1.0},
     }
@@ -258,9 +258,9 @@ def build_body(
     if use_tools or use_functions:
         tools: list[dict] = []
         if use_tools:
-            tools.append({"google_search_retrieval": {}})
+            tools.append({"googleSearchRetrieval": {}})
         if use_functions:
-            tools.append({"function_declarations": FUNCTION_DECLARATIONS})
+            tools.append({"functionDeclarations": FUNCTION_DECLARATIONS})
         body["tools"] = tools
     return body
 
@@ -429,7 +429,7 @@ async def call_gemini_raw(
         return None
     model = get_gemini_model(cid)
     body = {
-        "system_instruction": {"parts": [{"text": system_text}]},
+        "systemInstruction": {"parts": [{"text": system_text}]},
         "contents": [{"role": "user", "parts": _normalize_parts(parts)}],
         "generationConfig": {"maxOutputTokens": MAX_OUTPUT_TOKENS, "temperature": 0.4},
     }

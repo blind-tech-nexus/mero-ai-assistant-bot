@@ -40,8 +40,8 @@ async def transcribe_audio_inline(
                 "role": "user",
                 "parts": [
                     {
-                        "inline_data": {
-                            "mime_type": mime_type,
+                        "inlineData": {
+                            "mimeType": mime_type,
                             "data": encoded_audio,
                         }
                     },

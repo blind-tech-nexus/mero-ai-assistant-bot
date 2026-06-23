@@ -2,7 +2,6 @@ from typing import Optional
 
 from gemini_files import transcribe_audio_inline
 from message import download_telegram_file, send_document_bytes, send_message
-from config import USER_MODEL
 
 MAX_AUDIO_BYTES = 20 * 1024 * 1024  # 20MB limit for inline data
 
@@ -14,10 +13,11 @@ async def transcribe_audio_bytes(
     chat_id: Optional[int] = None,
 ) -> tuple[Optional[str], Optional[str]]:
     """Transcribe audio bytes using Gemini inline_data approach."""
+    cid = chat_id if chat_id is not None else 0
     return await transcribe_audio_inline(
         audio_bytes,
         mime_type,
-        model=USER_MODEL,
+        chat_id=cid,
     )
 
 
